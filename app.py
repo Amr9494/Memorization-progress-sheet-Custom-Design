@@ -356,7 +356,7 @@ def generate_booklet_from_template(
     has_front_cover: bool,
     has_back_cover: bool,
 ) -> io.BytesIO:
-    """Generates the booklet by overlaying dates directly onto an uploaded 1-page PDF template."""
+    """Overlays dates and months onto the custom template and adds automatic page numbers."""
     raw_template_bytes = template_file.getvalue()
     source_doc = fitz.open(stream=raw_template_bytes, filetype="pdf")
 
@@ -378,7 +378,7 @@ def generate_booklet_from_template(
         ):
             month_break_indices.append(idx)
 
-    # Signature math (modulo 4 booklet layout)
+    # 4-page signature booklet padding
     cover_count = (1 if has_front_cover else 0) + (1 if has_back_cover else 0)
     current_total = raw_content_pages + cover_count
     needed_blanks = (4 - (current_total % 4)) % 4
@@ -397,79 +397,123 @@ def generate_booklet_from_template(
     page_num = 1
 
     for idx, page_dates in enumerate(page_chunks):
-        # Open a fresh instance of the template page
         page_doc = fitz.open(stream=raw_template_bytes, filetype="pdf")
         page = page_doc[0]
 
-        # Register custom font if available
-        font_ref = "helv"
-        if font_path and os.path.exists(font_path):
-            try:
-                page.insert_font(fontname="CustomFont", fontfile=font_path)
-                font_ref = "CustomFont"
-            except Exception:
-                font_ref = "helv"
+        # Prepare text strings
+        # Keep Month in clean English (e.g., 'October 2026') or bilingual to prevent missing font glyphs
+        month_str = page_dates[0].strftime("%B %Y")
 
-        # Build replacement dictionary
         replacements = {
-            "{{PAGE_NUM}}": f"—— [ {page_num} ] ——",
-            "{{MONTH}}": process_arabic_pdf(page_dates[0].strftime("%B %Y")),
+            "{{MONTH}}": month_str,
         }
 
         for slot_idx, d in enumerate(page_dates):
-            tag_name = f"{{{{DATE_{slot_idx + 1}}}}}"
-            replacements[tag_name] = d.strftime("%d %B")
+            replacements[f"{{{{DATE_{slot_idx + 1}}}}}"] = d.strftime("%d %B")
 
-        # Clear remaining unused slots on the template
-        for unused_slot in range(len(page_dates) + 1, 4):
+        # Clear any unused slot tags
+        for unused_slot in range(len(page_dates) + 1, 5):
             replacements[f"{{{{DATE_{unused_slot}}}}}"] = ""
 
-        # Search bounding boxes, redact placeholder text, and insert target text
-        for tag, val in replacements.items():
-            rects = page.search_for(tag)
-            for r in rects:
-                page.add_redact_annot(r)
-                page.apply_redactions()
+        # Remove optional legacy {{PAGE_NUM}} tag if present
+        for p_tag in page.search_for("{{PAGE_NUM}}"):
+            page.add_redact_annot(p_tag)
 
-                if val:
-                    font_sz = int(11 * font_scale)
-                    page.insert_textbox(
-                        r,
+        # 1. Redact placeholders
+        for tag in replacements.keys():
+            for r in page.search_for(tag):
+                page.add_redact_annot(r)
+        page.apply_redactions()
+
+        # 2. Draw actual values into the cleared positions
+        for tag, val in replacements.items():
+            if not val:
+                continue
+            # Re-search or use coordinate memory
+            rects = source_doc[0].search_for(tag)
+            for r in rects:
+                font_sz = int(12 * font_scale)
+                # Compute center point of the original placeholder box
+                center_y = (r.y0 + r.y1) / 2 + (font_sz / 3)
+                center_x = (r.x0 + r.x1) / 2
+
+                # Fallback to standard Helvetica if custom font is not loaded
+                if font_path and os.path.exists(font_path):
+                    try:
+                        page.insert_font(
+                            fontname="CustomFont", fontfile=font_path
+                        )
+                        page.insert_text(
+                            fitz.Point(r.x0, center_y),
+                            val,
+                            fontsize=font_sz,
+                            fontname="CustomFont",
+                            color=(0.15, 0.2, 0.25),
+                        )
+                    except Exception:
+                        page.insert_text(
+                            fitz.Point(r.x0, center_y),
+                            val,
+                            fontsize=font_sz,
+                            fontname="helv",
+                            color=(0.15, 0.2, 0.25),
+                        )
+                else:
+                    page.insert_text(
+                        fitz.Point(r.x0, center_y),
                         val,
                         fontsize=font_sz,
-                        fontname=font_ref,
-                        align=fitz.TEXT_ALIGN_CENTER,
+                        fontname="helv",
+                        color=(0.15, 0.2, 0.25),
                     )
+
+        # 3. AUTOMATIC PAGE NUMBER (Always placed at bottom center, no placeholder needed)
+        footer_text = f"—— [ {page_num} ] ——"
+        page.insert_text(
+            fitz.Point(page.rect.width / 2 - 28, page.rect.height - 25),
+            footer_text,
+            fontsize=9.5,
+            fontname="helv",
+            color=(0.4, 0.4, 0.4),
+        )
 
         final_doc.insert_pdf(page_doc)
         page_num += 1
 
-        # Add notes/blank pages
+        # 4. Automatic Blank / Notes Pages
         num_blanks = blank_insert_after.count(idx)
         for _ in range(num_blanks):
             blank_page = final_doc.new_page(
                 width=page.rect.width, height=page.rect.height
             )
-            blank_page.insert_textbox(
-                fitz.Rect(50, 40, page.rect.width - 50, 70),
-                process_arabic_pdf("ملاحظات / Notes"),
-                fontsize=14,
-                align=fitz.TEXT_ALIGN_CENTER,
-            )
-            # Add dashed lined notes background
-            y = 100
-            while y < page.rect.height - 80:
-                p1 = fitz.Point(50, y)
-                p2 = fitz.Point(page.rect.width - 50, y)
-                blank_page.draw_line(
-                    p1, p2, color=(0.7, 0.7, 0.7), dashes="[2 2]"
-                )
-                y += 30
-
             blank_page.insert_text(
-                fitz.Point(page.rect.width / 2 - 30, page.rect.height - 30),
+                fitz.Point(blank_page.rect.width / 2 - 45, 60),
+                "Notes / ملاحظات",
+                fontsize=13,
+                fontname="helv",
+                color=(0.2, 0.2, 0.2),
+            )
+
+            # Lined notes guide
+            y = 95
+            while y < blank_page.rect.height - 70:
+                blank_page.draw_line(
+                    fitz.Point(45, y),
+                    fitz.Point(blank_page.rect.width - 45, y),
+                    color=(0.78, 0.82, 0.85),
+                    dashes="[1 3]",
+                )
+                y += 28
+
+            # Automatic footer on notes pages
+            blank_page.insert_text(
+                fitz.Point(
+                    blank_page.rect.width / 2 - 28, blank_page.rect.height - 25
+                ),
                 f"—— [ {page_num} ] ——",
-                fontsize=10,
+                fontsize=9.5,
+                fontname="helv",
+                color=(0.4, 0.4, 0.4),
             )
             page_num += 1
 
